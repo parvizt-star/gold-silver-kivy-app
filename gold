@@ -1,0 +1,623 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import requests
+import re
+
+# -----------------------
+#  توابع کمکی شبکه و پارس
+# -----------------------
+
+def _clean_irr(num_str: str) -> int:
+    """تبدیل رشته 112,772,250 یا 68,868.41 به عدد صحیح"""
+    if not num_str:
+        raise ValueError("رشته خالی برای قیمت")
+    s = num_str.replace("\u00a0", "").replace(",", "").strip()
+    # اگر اعشار داشت (مثلاً 68,868.41) فقط قسمت صحیح را می‌گیریم
+    if "." in s:
+        s = s.split(".")[0]
+    return int(s)
+
+
+def fetch_gold_price_gram_irr(karat: int) -> int:
+    """
+    دریافت قیمت هر گرم طلا (18k یا 24k) به ریال ایران با چند سرور پشتیبان.
+    اگر همه قطع باشند Exception می‌اندازد.
+    """
+    errors = []
+
+    # 1) goldrate.com – شامل 18k/22k/24k بر حسب گرم
+    try:
+        resp = requests.get("https://goldrate.com/en/gold/iran", timeout=7)
+        if resp.ok:
+            html = resp.text
+            if karat == 18:
+                pattern = r"18k Gold / g\s*IRR\s*([\d,\.]+)"
+            elif karat == 24:
+                pattern = r"24k Gold / g\s*IRR\s*([\d,\.]+)"
+            else:
+                pattern = None
+
+            if pattern:
+                m = re.search(pattern, html)
+                if m:
+                    return _clean_irr(m.group(1))
+    except Exception as e:
+        errors.append(f"goldrate: {e}")
+
+    # 2) pricegold.net – صفحه مخصوص هر عیار
+    try:
+        if karat == 18:
+            url = "https://pricegold.net/ir-iran/18k-gold/"
+        elif karat == 24:
+            url = "https://pricegold.net/ir-iran/24k-gold/"
+        else:
+            url = None
+
+        if url:
+            resp = requests.get(url, timeout=7)
+            if resp.ok:
+                m = re.search(r"Gram price IRR.?([\d,]+)", resp.text)
+                if m:
+                    return _clean_irr(m.group(1))
+    except Exception as e:
+        errors.append(f"pricegold: {e}")
+
+    # 3) goldpricez.com – 18k و 24k
+    try:
+        if karat == 18:
+            url = "https://goldpricez.com/ir/18k/gram"
+        elif karat == 24:
+            url = "https://goldpricez.com/ir/24k/gram"
+        else:
+            url = None
+
+        if url:
+            resp = requests.get(url, timeout=7)
+            if resp.ok:
+                m = re.search(
+                    r"Today's\s+.*?Price per Gram in Iran is\s*([\d,\.]+)\s*IRR",
+                    resp.text
+                )
+                if m:
+                    return _clean_irr(m.group(1))
+    except Exception as e:
+        errors.append(f"goldpricez: {e}")
+
+    raise RuntimeError("اتصال به سرورهای قیمت طلا ممکن نشد.\n" + "\n".join(errors[-2:]))
+
+
+def fetch_silver_price_gram_irr(purity: int) -> int:
+    """
+    دریافت قیمت هر گرم نقره 999 / 925 / 900 به ریال ایران با چند سرور.
+    """
+    errors = []
+
+    # 1) goldrate.com – صفحه نقره ایران
+    try:
+        resp = requests.get("https://goldrate.com/en/silver/iran", timeout=7)
+        if resp.ok:
+            html = resp.text
+            if purity == 999:
+                pattern = r"999 Silver / g\s*IRR\s*([\d,\.]+)"
+            elif purity == 925:
+                pattern = r"925 Silver / g\s*IRR\s*([\d,\.]+)"
+            elif purity == 900:
+                pattern = r"900 Silver / g\s*IRR\s*([\d,\.]+)"
+            else:
+                pattern = None
+            if pattern:
+                m = re.search(pattern, html)
+                if m:
+                    return _clean_irr(m.group(1))
+    except Exception as e:
+        errors.append(f"goldrate-silver: {e}")
+
+    # 2) goldpricez – قیمت کلی نقره بر گرم (برای 999)
+    try:
+        resp = requests.get("https://goldpricez.com/silver-rates/iran", timeout=7)
+        if resp.ok:
+            # "Today's  Silver Price per Gram in Iran is 69,060.89 IRR."
+            m = re.search(
+                r"Today's\s+Silver Price per Gram in Iran is\s*([\d,\.]+)\s*IRR",
+                resp.text
+            )
+            if m:
+                base999 = _clean_irr(m.group(1))
+                if purity == 999:
+                    return base999
+                elif purity == 925:
+                    return int(base999 * 0.925)
+                elif purity == 900:
+                    return int(base999 * 0.900)
+    except Exception as e:
+        errors.append(f"goldpricez-silver: {e}")
+
+    raise RuntimeError("اتصال به سرورهای قیمت نقره ممکن نشد.\n" + "\n".join(errors[-2:]))
+
+# -----------------------
+#  توابع محاسبه
+# -----------------------
+
+def calculate_gold():
+    try:
+        weight = float(entry_gold_weight.get())
+        price = float(entry_gold_price.get())
+        making = float(entry_gold_making.get() or 0)
+        profit_percent = float(entry_gold_profit.get() or 0)
+        fee = float(entry_gold_fee.get() or 0)
+        tax_rate = float(entry_gold_tax.get() or 0) / 100
+        seller_price = float(entry_gold_seller.get() or 0)
+
+        product = combo_gold_product.get()
+
+        # قیمت پایه
+        base = weight * price
+
+        # نو / آب‌شده / سرمایه‌ای → با اجرت و سود
+        if product in ("نو", "آب‌شده", "سرمایه‌ای"):
+            making_cost = weight * making
+            profit = (base + making_cost) * (profit_percent / 100.0)
+        else:  # دست دوم
+            making_cost = 0
+            profit = 0
+
+        fee_amount = fee
+        taxable = base + making_cost + profit + fee_amount
+        tax = taxable * tax_rate
+        final = taxable + tax
+
+        text = []
+        text.append("💛 محاسبه طلا")
+        text.append(f"وزن: {weight} گرم")
+        text.append(f"قیمت هر گرم: {price:,.0f}")
+        text.append(f"نوع محصول: {product}")
+        text.append("")
+        text.append("📐 فرمول‌ها:")
+        text.append("Base = وزن × قیمت هر گرم")
+        text.append(f"Base = {weight} × {price:,.0f} = {base:,.0f}")
+        text.append("")
+        text.append("اجرت = وزن × اجرت هر گرم")
+        text.append(f"اجرت = {weight} × {making:,.0f} = {making_cost:,.0f}")
+        text.append("")
+        text.append("سود فروشنده = (Base + اجرت) × درصد سود")
+        text.append(
+            f"سود = ({base:,.0f} + {making_cost:,.0f}) × {profit_percent}% = {profit:,.0f}"
+        )
+        text.append("")
+        text.append("کارمزد = مبلغ ثابت وارد شده")
+        text.append(f"کارمزد = {fee_amount:,.0f}")
+        text.append("")
+        text.append("مالیات = (Base + اجرت + سود + کارمزد) × درصد مالیات")
+        text.append(
+            f"مالیات = ({base:,.0f} + {making_cost:,.0f} + {profit:,.0f} + {fee_amount:,.0f}) × {tax_rate*100:.1f}% = {tax:,.0f}"
+        )
+        text.append("")
+        text.append("💰 قیمت نهایی = Base + اجرت + سود + کارمزد + مالیات")
+        text.append(f"قیمت نهایی = {final:,.0f} تومان")
+
+        if seller_price:
+            diff = seller_price - final
+            text.append("")
+            if diff > 0:
+                text.append(
+                    f"⚠ قیمت طلافروش حدود {diff:,.0f} تومان گران‌تر از محاسبه شماست."
+                )
+            elif diff < 0:
+                text.append(
+                    f"✔ قیمت طلافروش حدود {abs(diff):,.0f} تومان ارزان‌تر از محاسبه شماست."
+                )
+            else:
+                text.append("✔ قیمت طلافروش دقیقاً برابر محاسبه است.")
+
+        txt_gold_result.config(state="normal")
+        txt_gold_result.delete("1.0", "end")
+        txt_gold_result.insert("end", "\n".join(text))
+        txt_gold_result.config(state="disabled")
+
+    except Exception as e:
+        messagebox.showerror("خطا", f"ورودی‌ها را بررسی کنید.\n{e}")
+
+
+def calculate_silver():
+    try:
+        weight = float(entry_silver_weight.get())
+        price = float(entry_silver_price.get())
+        making = float(entry_silver_making.get() or 0)
+        profit_percent = float(entry_silver_profit.get() or 0)
+        fee = float(entry_silver_fee.get() or 0)
+        tax_rate = float(entry_silver_tax.get() or 0) / 100
+        seller_price = float(entry_silver_seller.get() or 0)
+
+        product = combo_silver_product.get()
+
+        base = weight * price
+
+        if product in ("نو", "سرمایه‌ای"):
+            making_cost = weight * making
+            profit = (base + making_cost) * (profit_percent / 100.0)
+        else:  # دست دوم
+            making_cost = 0
+            profit = 0
+
+        fee_amount = fee
+        taxable = base + making_cost + profit + fee_amount
+        tax = taxable * tax_rate
+        final = taxable + tax
+
+        purity_text = combo_silver_purity.get()
+
+        text = []
+        text.append("🥈 محاسبه نقره")
+        text.append(f"عیار: {purity_text}")
+        text.append(f"وزن: {weight} گرم")
+        text.append(f"قیمت هر گرم: {price:,.0f}")
+        text.append(f"نوع محصول: {product}")
+        text.append("")
+        text.append("📐 فرمول‌ها:")
+        text.append("Base = وزن × قیمت هر گرم")
+        text.append(f"Base = {weight} × {price:,.0f} = {base:,.0f}")
+        text.append("")
+        text.append("اجرت = وزن × اجرت هر گرم")
+        text.append(f"اجرت = {weight} × {making:,.0f} = {making_cost:,.0f}")
+        text.append("")
+        text.append("سود فروشنده = (Base + اجرت) × درصد سود")
+        text.append(
+            f"سود = ({base:,.0f} + {making_cost:,.0f}) × {profit_percent}% = {profit:,.0f}"
+        )
+        text.append("")
+        text.append("کارمزد = مبلغ ثابت وارد شده")
+        text.append(f"کارمزد = {fee_amount:,.0f}")
+        text.append("")
+        text.append("مالیات = (Base + اجرت + سود + کارمزد) × درصد مالیات")
+        text.append(
+            f"مالیات = ({base:,.0f} + {making_cost:,.0f} + {profit:,.0f} + {fee_amount:,.0f}) × {tax_rate*100:.1f}% = {tax:,.0f}"
+        )
+        text.append("")
+        text.append("💰 قیمت نهایی = Base + اجرت + سود + کارمزد + مالیات")
+        text.append(f"قیمت نهایی = {final:,.0f} تومان")
+
+        if seller_price:
+            diff = seller_price - final
+            text.append("")
+            if diff > 0:
+                text.append(
+                    f"⚠ قیمت فروشنده حدود {diff:,.0f} تومان گران‌تر از محاسبه شماست."
+                )
+            elif diff < 0:
+                text.append(
+                    f"✔ قیمت فروشنده حدود {abs(diff):,.0f} تومان ارزان‌تر از محاسبه شماست."
+                )
+            else:
+                text.append("✔ قیمت فروشنده دقیقاً برابر محاسبه است.")
+
+        txt_silver_result.config(state="normal")
+        txt_silver_result.delete("1.0", "end")
+        txt_silver_result.insert("end", "\n".join(text))
+        txt_silver_result.config(state="disabled")
+
+    except Exception as e:
+        messagebox.showerror("خطا", f"ورودی‌های نقره را بررسی کنید.\n{e}")
+
+# -----------------------
+#  دکمه‌های قیمت لحظه‌ای
+# -----------------------
+
+def fetch_gold_live():
+    try:
+        karat_text = combo_gold_karat.get()
+        karat = 18 if "18" in karat_text else 24
+        price = fetch_gold_price_gram_irr(karat)
+        if rial_to_toman_var.get():
+            price = price // 10
+        entry_gold_price.delete(0, "end")
+        entry_gold_price.insert(0, str(price))
+        messagebox.showinfo("قیمت طلا", f"قیمت لحظه‌ای {karat} عیار: {price:,.0f}")
+    except Exception as e:
+        messagebox.showerror("خطا", str(e))
+
+
+def fetch_silver_live():
+    try:
+        purity_text = combo_silver_purity.get()
+        if "999" in purity_text:
+            purity = 999
+        elif "925" in purity_text:
+            purity = 925
+        else:
+            purity = 900
+        price = fetch_silver_price_gram_irr(purity)
+        if rial_to_toman_var.get():
+            price = price // 10
+        entry_silver_price.delete(0, "end")
+        entry_silver_price.insert(0, str(price))
+        messagebox.showinfo("قیمت نقره", f"قیمت لحظه‌ای {purity} نقره: {price:,.0f}")
+    except Exception as e:
+        messagebox.showerror("خطا", str(e))
+
+# -----------------------
+#  تم‌ها
+# -----------------------
+
+def apply_theme(theme_name: str):
+    # پس‌زمینه کلی
+    if theme_name == "Gold":
+        bg = "#2b1f09"
+        fg = "#f7d774"
+    elif theme_name == "Dark":
+        bg = "#202124"
+        fg = "#ffffff"
+    elif theme_name == "Light":
+        bg = "#f5f5f5"
+        fg = "#000000"
+    elif theme_name == "Mobile Style":
+        bg = "#ffffff"
+        fg = "#111111"
+    else:
+        bg = "#f5f5f5"
+        fg = "#000000"
+
+    root.configure(bg=bg)
+    style.configure("TFrame", background=bg)
+    style.configure("TLabelframe", background=bg, foreground=fg)
+    style.configure("TLabelframe.Label", background=bg, foreground=fg)
+    style.configure("TLabel", background=bg, foreground=fg)
+    style.configure("TButton", padding=6)
+    style.configure("TCombobox", padding=4)
+
+    # Mobile Style → فونت بزرگ‌تر
+    def apply_theme(theme_name: str):
+        if theme_name == "Gold":
+            bg = "#2b1f09"
+            fg = "#f7d774"
+        elif theme_name == "Dark":
+            bg = "#202124"
+            fg = "#ffffff"
+        elif theme_name == "Light":
+            bg = "#f5f5f5"
+            fg = "#000000"
+        elif theme_name == "Mobile Style":
+            bg = "#ffffff"
+            fg = "#111111"
+        else:
+            bg = "#f5f5f5"
+            fg = "#000000"
+
+        root.configure(bg=bg)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabelframe", background=bg, foreground=fg)
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("TButton", padding=6)
+        style.configure("TCombobox", padding=4)
+
+        # 👇 این بخش را اصلاح کن
+        root.option_clear()
+        if theme_name == "Mobile Style":
+            # فونت درشت‌تر
+            root.option_add("*Font", "{Segoe UI} 11")
+        else:
+            root.option_add("*Font", "{Segoe UI} 9")
+
+
+# -----------------------
+#  ساخت GUI
+# -----------------------
+
+root = tk.Tk()
+root.title("ماشین حساب حرفه‌ای طلا و نقره ایران")
+root.geometry("1000x650")
+
+style = ttk.Style(root)
+style.theme_use("default")
+
+# نوار بالایی برای تم و تنظیم تومان/ریال
+top_frame = ttk.Frame(root)
+top_frame.pack(side="top", fill="x", pady=5, padx=10)
+
+ttk.Label(top_frame, text="تم:").pack(side="right")
+combo_theme = ttk.Combobox(
+    top_frame,
+    values=["Gold", "Dark", "Light", "Mobile Style"],
+    width=15
+)
+combo_theme.set("Gold")
+ttk.Button(top_frame, text="اعمال تم", command=lambda: apply_theme(combo_theme.get())).pack(
+    side="right", padx=5
+)
+
+rial_to_toman_var = tk.IntVar(value=1)
+chk_toman = ttk.Checkbutton(
+    top_frame,
+    text="تبدیل ریال به تومان (÷۱۰)",
+    variable=rial_to_toman_var
+)
+chk_toman.pack(side="left")
+
+apply_theme("Gold")
+
+# دفترچه تب‌ها
+notebook = ttk.Notebook(root)
+notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+frame_gold = ttk.Frame(notebook)
+frame_silver = ttk.Frame(notebook)
+
+notebook.add(frame_gold, text="طلا")
+notebook.add(frame_silver, text="نقره")
+
+# -----------------------
+#  تب طلا
+# -----------------------
+
+frame_gold.columnconfigure(0, weight=1)
+frame_gold.columnconfigure(1, weight=2)
+
+gold_inputs = ttk.Labelframe(frame_gold, text="ورودی‌های طلا")
+gold_inputs.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+gold_outputs = ttk.Labelframe(frame_gold, text="نتیجه و فرمول")
+gold_outputs.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+
+# ورودی‌ها – طلا
+row = 0
+ttk.Label(gold_inputs, text="عیار طلا:").grid(row=row, column=0, sticky="w", pady=2)
+combo_gold_karat = ttk.Combobox(
+    gold_inputs,
+    values=["طلای 18 عیار", "طلای 24 عیار"],
+    width=18
+)
+combo_gold_karat.set("طلای 18 عیار")
+combo_gold_karat.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="نوع محصول:").grid(row=row, column=0, sticky="w", pady=2)
+combo_gold_product = ttk.Combobox(
+    gold_inputs,
+    values=["نو", "دست دوم", "آب‌شده", "سرمایه‌ای"],
+    width=18
+)
+combo_gold_product.set("نو")
+combo_gold_product.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="وزن (گرم):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_weight = ttk.Entry(gold_inputs)
+entry_gold_weight.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="قیمت هر گرم طلا (تومان):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_price = ttk.Entry(gold_inputs)
+entry_gold_price.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+btn_gold_live = ttk.Button(gold_inputs, text="دریافت قیمت لحظه‌ای طلا", command=fetch_gold_live)
+btn_gold_live.grid(row=row, column=0, columnspan=2, sticky="we", pady=4)
+
+row += 1
+ttk.Label(gold_inputs, text="اجرت (تومان/گرم):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_making = ttk.Entry(gold_inputs)
+entry_gold_making.insert(0, "300000")
+entry_gold_making.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="سود فروشنده (%):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_profit = ttk.Entry(gold_inputs)
+entry_gold_profit.insert(0, "7")
+entry_gold_profit.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="کارمزد ثابت (تومان):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_fee = ttk.Entry(gold_inputs)
+entry_gold_fee.insert(0, "0")
+entry_gold_fee.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="مالیات (%):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_tax = ttk.Entry(gold_inputs)
+entry_gold_tax.insert(0, "9")
+entry_gold_tax.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(gold_inputs, text="قیمت اعلامی طلافروش (اختیاری):").grid(row=row, column=0, sticky="w", pady=2)
+entry_gold_seller = ttk.Entry(gold_inputs)
+entry_gold_seller.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+btn_calc_gold = ttk.Button(gold_inputs, text="محاسبه طلا", command=calculate_gold)
+btn_calc_gold.grid(row=row, column=0, columnspan=2, sticky="we", pady=8)
+
+for c in range(2):
+    gold_inputs.columnconfigure(c, weight=1)
+
+txt_gold_result = tk.Text(gold_outputs, wrap="word")
+txt_gold_result.pack(fill="both", expand=True, padx=5, pady=5)
+txt_gold_result.config(state="disabled")
+
+# -----------------------
+#  تب نقره
+# -----------------------
+
+frame_silver.columnconfigure(0, weight=1)
+frame_silver.columnconfigure(1, weight=2)
+
+silver_inputs = ttk.Labelframe(frame_silver, text="ورودی‌های نقره")
+silver_inputs.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+silver_outputs = ttk.Labelframe(frame_silver, text="نتیجه و فرمول")
+silver_outputs.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
+
+row = 0
+ttk.Label(silver_inputs, text="عیار نقره:").grid(row=row, column=0, sticky="w", pady=2)
+combo_silver_purity = ttk.Combobox(
+    silver_inputs,
+    values=["نقره 999 (خالص)", "نقره 925 (استرلینگ)", "نقره 900"],
+    width=20
+)
+combo_silver_purity.set("نقره 999 (خالص)")
+combo_silver_purity.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="نوع محصول:").grid(row=row, column=0, sticky="w", pady=2)
+combo_silver_product = ttk.Combobox(
+    silver_inputs,
+    values=["نو", "دست دوم", "سرمایه‌ای"],
+    width=20
+)
+combo_silver_product.set("نو")
+combo_silver_product.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="وزن (گرم):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_weight = ttk.Entry(silver_inputs)
+entry_silver_weight.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="قیمت هر گرم نقره (تومان):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_price = ttk.Entry(silver_inputs)
+entry_silver_price.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+btn_silver_live = ttk.Button(silver_inputs, text="دریافت قیمت لحظه‌ای نقره", command=fetch_silver_live)
+btn_silver_live.grid(row=row, column=0, columnspan=2, sticky="we", pady=4)
+
+row += 1
+ttk.Label(silver_inputs, text="اجرت (تومان/گرم):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_making = ttk.Entry(silver_inputs)
+entry_silver_making.insert(0, "100000")
+entry_silver_making.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="سود فروشنده (%):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_profit = ttk.Entry(silver_inputs)
+entry_silver_profit.insert(0, "5")
+entry_silver_profit.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="کارمزد ثابت (تومان):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_fee = ttk.Entry(silver_inputs)
+entry_silver_fee.insert(0, "0")
+entry_silver_fee.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="مالیات (%):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_tax = ttk.Entry(silver_inputs)
+entry_silver_tax.insert(0, "9")
+entry_silver_tax.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+ttk.Label(silver_inputs, text="قیمت اعلامی فروشنده (اختیاری):").grid(row=row, column=0, sticky="w", pady=2)
+entry_silver_seller = ttk.Entry(silver_inputs)
+entry_silver_seller.grid(row=row, column=1, sticky="we", pady=2)
+
+row += 1
+btn_calc_silver = ttk.Button(silver_inputs, text="محاسبه نقره", command=calculate_silver)
+btn_calc_silver.grid(row=row, column=0, columnspan=2, sticky="we", pady=8)
+
+for c in range(2):
+    silver_inputs.columnconfigure(c, weight=1)
+
+txt_silver_result = tk.Text(silver_outputs, wrap="word")
+txt_silver_result.pack(fill="both", expand=True, padx=5, pady=5)
+txt_silver_result.config(state="disabled")
+
+root.mainloop()
